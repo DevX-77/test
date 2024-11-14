@@ -2,23 +2,59 @@ const readline = require('readline');
 const { db } = require('../handlers/db.js');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
-const CatLoggr = require('cat-loggr');
-const log = new CatLoggr();
-const saltRounds = 10;
+const log = new (require('cat-loggr'))();
+const saltRounds = process.env.SALT_ROUNDS || 10;
 
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
 
-// Function to create a new user
-async function createUser(username, password, isAdmin) {
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
-    const userId = uuidv4();
-    return db.set(username, { userId, username, password: hashedPassword, admin: isAdmin });
+function parseArguments() {
+    const args = {};
+    process.argv.slice(2).forEach(arg => {
+        const [key, value] = arg.split('=');
+        if (key.startsWith('--')) {
+            args[key.slice(2)] = value;
+        }
+    });
+    return args;
 }
 
-// Function to ask questions to the user (for interactive input)
+async function doesUserExist(username) {
+    const users = await db.get('users');
+    return users ? users.some(user => user.username === username) : false;
+}
+
+async function doesEmailExist(email) {
+    const users = await db.get('users');
+    return users ? users.some(user => user.email === email) : false;
+}
+
+async function initializeUsersTable(username, email, password) {
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const userId = uuidv4();
+    const users = [{ userId, username, email, password: hashedPassword, accessTo: [], admin: true, verified: true }];
+    return db.set('users', users);
+}
+
+async function addUserToUsersTable(username, email, password) {
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const userId = uuidv4();
+    const users = await db.get('users') || [];
+    users.push({ userId, username, email, password: hashedPassword, accessTo: [], admin: true, verified: true });
+    return db.set('users', users);
+}
+
+async function createUser(username, email, password) {
+    const users = await db.get('users');
+    if (!users) {
+        return initializeUsersTable(username, email, password);
+    } else {
+        return addUserToUsersTable(username, email, password);
+    }
+}
+
 function askQuestion(question) {
     return new Promise((resolve) => {
         rl.question(question, (answer) => {
@@ -27,51 +63,55 @@ function askQuestion(question) {
     });
 }
 
-// Function to parse command-line arguments
-function parseArgs() {
-    const args = process.argv.slice(2);  // Get arguments after the script name
-    const options = {};
-    
-    args.forEach((arg, index) => {
-        if (arg === '--admin' && args[index + 1]) {
-            options.admin = args[index + 1].toLowerCase() === 'true';
-        }
-        if (arg === '--username' && args[index + 1]) {
-            options.username = args[index + 1];
-        }
-        if (arg === '--password' && args[index + 1]) {
-            options.password = args[index + 1];
-        }
-    });
-
-    return options;
+function isValidEmail(email) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
 }
 
-// Main function to control the flow
 async function main() {
-    const options = parseArgs();
+    const args = parseArguments();
+    
+    let username, email, password;
 
-    if (!options.username || !options.password) {
-        log.error('Username and password are required.');
-        rl.close();
-        return;
+    if (args.username && args.email && args.password) {
+        username = args.username;
+        email = args.email;
+        password = args.password;
+    } else {
+        log.init('Create a new *admin* user for the Skyport Panel:');
+        log.init('You can make regular users from the admin -> users page.');
+        
+        username = await askQuestion("Username: ");
+        email = await askQuestion("Email: ");
+        
+        if (!isValidEmail(email)) {
+            log.error("Invalid email!");
+            rl.close();
+            return;
+        }
+
+        password = await askQuestion("Password: ");
     }
 
-    log.init('Creating a new user:');
-    
-    const { username, password, admin = false } = options;
-
-    const userExists = await db.get(username);
-    if (userExists) {
+    const userExists = await doesUserExist(username);
+    const emailExists = await doesEmailExist(email);
+    if (userExists || emailExists) {
         log.error("User already exists!");
         rl.close();
         return;
     }
 
-    await createUser(username, password, admin);
-    log.info(`User ${username} created with ${admin ? 'admin' : 'regular'} privileges.`);
-    rl.close();
+    try {
+        await createUser(username, email, password);
+        log.info("Done! User created.");
+    } catch (err) {
+        log.error('Error creating user:', err);
+    } finally {
+        rl.close();
+    }
 }
 
-// Execute the main function
-main();
+main().catch(err => {
+    log.error('Unexpected error:', err);
+    rl.close();
+});
